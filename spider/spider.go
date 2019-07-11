@@ -9,86 +9,117 @@ import (
 	"github.com/gocolly/colly"
 	"github.com/nange/gospider/common"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 )
 
-func Run(task *Task, retCh chan<- common.MTS) error {
-	var db *sql.DB
-	var err error
-	if task.OutputConfig.Type == common.OutputTypeMySQL {
-		db, err = newDB(task.TaskConfig.OutputConfig.MySQLConf)
-		if err != nil {
-			logrus.Errorf("newDB failed! err:%#v", err)
-			return err
-		}
-	}
+// Spider the spider define
+type Spider struct {
+	task  *Task
+	retCh chan<- common.MTS
+	db    *sql.DB
+}
 
-	c, err := newCollector(task.TaskConfig)
+// New create a new spider object
+func New(task *Task, retCh chan<- common.MTS) *Spider {
+	return &Spider{
+		task:  task,
+		retCh: retCh,
+	}
+}
+
+// SetDB set the underlayer output db
+func (s *Spider) SetDB(db *sql.DB) {
+	s.db = db
+}
+
+// Run run a spider task
+func (s *Spider) Run() error {
+	c, err := newCollector(s.task.TaskConfig)
 	if err != nil {
-		logrus.Errorf("new collector err:%+v", err)
+		log.Errorf("new collector err:%+v", err)
 		return err
 	}
 
-	nodesLen := len(task.Rule.Nodes)
+	nodesLen := len(s.task.Rule.Nodes)
 	collectors := make([]*colly.Collector, 0, nodesLen)
-	for i := 0; i < len(task.Rule.Nodes); i++ {
+	for i := 0; i < len(s.task.Rule.Nodes); i++ {
 		nextC := c.Clone()
 		collectors = append(collectors, nextC)
 	}
 
 	ctxCtl, cancel := context.WithCancel(context.Background())
-	if err := addTaskCtrl(task.ID, cancel); err != nil {
-		return errors.Wrapf(err, "addTaskCtrl failed")
-	}
-
+	ctxs := make([]*Context, 0, nodesLen)
 	for i := 0; i < nodesLen; i++ {
 		var ctx *Context
 		if i != nodesLen-1 {
-			ctx = newContext(ctxCtl, cancel, task, collectors[i], collectors[i+1])
+			ctx, err = newContext(ctxCtl, cancel, s.task, collectors[i], collectors[i+1])
 		} else {
-			ctx = newContext(ctxCtl, cancel, task, collectors[i], nil)
+			ctx, err = newContext(ctxCtl, cancel, s.task, collectors[i], nil)
 		}
-		if task.OutputConfig.Type == common.OutputTypeMySQL {
-			ctx.setOutputDB(db)
+		if err != nil {
+			return err
+		}
+		ctxs = append(ctxs, ctx)
+		if s.task.OutputConfig.Type == common.OutputTypeMySQL {
+			if s.db != nil {
+				ctx.setOutputDB(s.db)
+			} else {
+				db, err := common.NewDB(s.task.OutputConfig.MySQLConf)
+				if err != nil {
+					return err
+				}
+				ctx.setOutputDB(db)
+			}
 		}
 
-		addCallback(ctx, task.Rule.Nodes[i])
+		addCallback(ctx, s.task.Rule.Nodes[i])
 	}
 
-	headCtx := newContext(ctxCtl, cancel, task, c, collectors[0])
+	headCtx, err := newContext(ctxCtl, cancel, s.task, c, collectors[0])
+	if err != nil {
+		return err
+	}
+	if s.task.OutputConfig.Type == common.OutputTypeMySQL {
+		headCtx.setOutputDB(s.db)
+	}
 	headWrapper := func(ctx *Context) (err error) {
 		defer func() {
 			if e := recover(); e != nil {
 				if v, ok := e.(error); ok {
 					err = v
 				} else {
-					str := fmt.Sprintf("%v", e)
-					err = errors.New(str)
+					err = fmt.Errorf("%v", e)
 				}
-				logrus.Errorf("Head unexcepted exited, err: %+v, stack:\n%s", e, string(debug.Stack()))
+				log.Errorf("Head unexcepted exited, err: %+v, stack:\n%s", e, string(debug.Stack()))
 			}
 		}()
-		return task.Rule.Head(ctx)
+		return s.task.Rule.Head(ctx)
 	}
 	if err := headWrapper(headCtx); err != nil {
-		logrus.Errorf("exec rule head func err:%#v", err)
+		log.Errorf("exec rule head func err:%#v", err)
 		return errors.WithStack(err)
+	}
+	if err := addTaskCtrl(s.task.ID, cancel); err != nil {
+		return errors.Wrapf(err, "addTaskCtrl failed")
 	}
 
 	go func() {
-		if db != nil {
-			defer db.Close()
-		}
-
 		for i := 0; i < nodesLen; i++ {
 			collectors[i].Wait()
-			logrus.Infof("task:%s %d step completed...", task.Name, i+1)
+			log.Infof("task:%s %d step completed...", s.task.Name, i+1)
 		}
 
-		if err := CancelTask(task.ID); err == nil {
-			retCh <- common.MTS{ID: task.ID, Status: common.TaskStatusCompleted}
+		CancelTask(s.task.ID)
+		s.retCh <- common.MTS{ID: s.task.ID, Status: common.TaskStatusCompleted}
+
+		for _, ctx := range ctxs {
+			ctx.closeCSVFileIfNeeded()
+			if ctx.outputDB != nil {
+				ctx.outputDB.Close()
+			}
 		}
-		logrus.Infof("task:%s run completed...", task.Name)
+
+		log.Infof("task:%s run completed...", s.task.Name)
 	}()
 
 	return nil
@@ -96,7 +127,7 @@ func Run(task *Task, retCh chan<- common.MTS) error {
 
 func cbDefer(ctx *Context, info string) {
 	if e := recover(); e != nil {
-		logrus.Error(info + fmt.Sprintf(", err: %+v, stack:\n%s", e, string(debug.Stack())))
+		log.Error(info + fmt.Sprintf(", err: %+v, stack:\n%s", e, string(debug.Stack())))
 		ctx.ctlCancel()
 	}
 }
@@ -109,7 +140,7 @@ func addCallback(ctx *Context, node *Node) {
 			newCtx := ctx.cloneWithReq(req)
 			select {
 			case <-newCtx.ctlCtx.Done():
-				logrus.Warnf("request has been canceled in OnRequest, url:%s", newCtx.GetRequest().URL.String())
+				log.Warnf("request has been canceled in OnRequest, url:%s", newCtx.GetRequest().URL.String())
 				newCtx.Abort()
 				return
 			default:
@@ -126,14 +157,14 @@ func addCallback(ctx *Context, node *Node) {
 			newCtx := ctx.cloneWithReq(res.Request)
 			select {
 			case <-newCtx.ctlCtx.Done():
-				logrus.Warnf("request has been canceled in OnError, url:%s", newCtx.GetRequest().URL.String())
+				log.Warnf("request has been canceled in OnError, url:%s", newCtx.GetRequest().URL.String())
 				return
 			default:
 			}
 
 			err := node.OnError(newCtx, newResponse(res, newCtx), e)
 			if err != nil {
-				logrus.Warnf("node.OnError return err:%+v, request url:%s", err, res.Request.URL.String())
+				log.Warnf("node.OnError return err:%+v, request url:%s", err, res.Request.URL.String())
 			}
 		})
 	}
@@ -145,14 +176,14 @@ func addCallback(ctx *Context, node *Node) {
 			newCtx := ctx.cloneWithReq(res.Request)
 			select {
 			case <-newCtx.ctlCtx.Done():
-				logrus.Warnf("request has been canceled in OnResponse, url:%s", newCtx.GetRequest().URL.String())
+				log.Warnf("request has been canceled in OnResponse, url:%s", newCtx.GetRequest().URL.String())
 				return
 			default:
 			}
 
 			err := node.OnResponse(newCtx, newResponse(res, newCtx))
 			if err != nil {
-				logrus.Warnf("node.OnResponse return err:%+v, request url:%s", err, res.Request.URL.String())
+				log.Warnf("node.OnResponse return err:%+v, request url:%s", err, res.Request.URL.String())
 			}
 		})
 	}
@@ -166,14 +197,14 @@ func addCallback(ctx *Context, node *Node) {
 				newCtx := ctx.cloneWithReq(el.Request)
 				select {
 				case <-newCtx.ctlCtx.Done():
-					logrus.Warnf("request has been canceled in OnHTML, url:%s", newCtx.GetRequest().URL.String())
+					log.Warnf("request has been canceled in OnHTML, url:%s", newCtx.GetRequest().URL.String())
 					return
 				default:
 				}
 
 				err := f(newCtx, newHTMLElement(el, newCtx))
 				if err != nil {
-					logrus.Warnf("node.OnHTML:%s return err:%+v, request url:%s", selector, err, el.Request.URL.String())
+					log.Warnf("node.OnHTML:%s return err:%+v, request url:%s", selector, err, el.Request.URL.String())
 				}
 			})
 		}
@@ -188,14 +219,14 @@ func addCallback(ctx *Context, node *Node) {
 				newCtx := ctx.cloneWithReq(el.Request)
 				select {
 				case <-newCtx.ctlCtx.Done():
-					logrus.Warnf("request has been canceled in OnXML, url:%s", newCtx.GetRequest().URL.String())
+					log.Warnf("request has been canceled in OnXML, url:%s", newCtx.GetRequest().URL.String())
 					return
 				default:
 				}
 
 				err := f(newCtx, newXMLElement(el, newCtx))
 				if err != nil {
-					logrus.Warnf("node.OnXML:%s return err:%+v, request url:%s", selector, err, el.Request.URL.String())
+					log.Warnf("node.OnXML:%s return err:%+v, request url:%s", selector, err, el.Request.URL.String())
 				}
 			})
 		}
@@ -208,14 +239,14 @@ func addCallback(ctx *Context, node *Node) {
 			newCtx := ctx.cloneWithReq(res.Request)
 			select {
 			case <-newCtx.ctlCtx.Done():
-				logrus.Warnf("request has been canceled in OnScraped, url:%s", newCtx.GetRequest().URL.String())
+				log.Warnf("request has been canceled in OnScraped, url:%s", newCtx.GetRequest().URL.String())
 				return
 			default:
 			}
 
 			err := node.OnScraped(newCtx, newResponse(res, newCtx))
 			if err != nil {
-				logrus.Warnf("node.OnScraped return err:%+v, request url:%s", err, res.Request.URL.String())
+				log.Warnf("node.OnScraped return err:%+v, request url:%s", err, res.Request.URL.String())
 			}
 		})
 	}

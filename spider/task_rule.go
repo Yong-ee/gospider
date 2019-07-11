@@ -4,6 +4,7 @@ import "github.com/pkg/errors"
 
 var rules = make(map[string]*TaskRule)
 
+// Register register a task rule
 func Register(rule *TaskRule) {
 	if err := checkRule(rule); err != nil {
 		panic(err)
@@ -11,28 +12,32 @@ func Register(rule *TaskRule) {
 	rules[rule.Name] = rule
 }
 
-type MultipleNamespacesConf struct {
+// MultipleNamespaceConf is the mutiple namespace conf
+type MultipleNamespaceConf struct {
 	OutputFields      []string
 	OutputConstraints map[string]*OutputConstraint
 	OutputTableOpts   string
 }
 
+// TaskRule is the task rule define
 type TaskRule struct {
-	Name                       string
-	Description                string
-	OutputToMultipleNamespaces bool
-	MultipleNamespacesConf     map[string]*MultipleNamespacesConf
-	Namespace                  string
-	OutputFields               []string
-	OutputConstraints          map[string]*OutputConstraint
-	OutputTableOpts            string
-	DisableCookies             bool
-	AllowURLRevisit            bool
-	IgnoreRobotsTxt            bool
-	ParseHTTPErrorResponse     bool
-	Rule                       *Rule
+	Name                      string
+	Description               string
+	OutputToMultipleNamespace bool
+	MultipleNamespaceConf     map[string]*MultipleNamespaceConf
+	Namespace                 string
+	OutputFields              []string
+	OutputConstraints         map[string]*OutputConstraint
+	OutputTableOpts           string
+	DisableCookies            bool
+	AllowURLRevisit           bool
+	IgnoreRobotsTxt           bool
+	InsecureSkipVerify        bool
+	ParseHTTPErrorResponse    bool
+	Rule                      *Rule
 }
 
+// GetTaskRule get task rule by ruleName
 func GetTaskRule(ruleName string) (*TaskRule, error) {
 	if rule, ok := rules[ruleName]; ok {
 		return rule, nil
@@ -40,6 +45,7 @@ func GetTaskRule(ruleName string) (*TaskRule, error) {
 	return nil, errors.WithStack(ErrTaskRuleNotExist)
 }
 
+// GetTaskRuleKeys return all keys of task rule
 func GetTaskRuleKeys() []string {
 	keys := make([]string, 0, len(rules))
 	for k := range rules {
@@ -49,11 +55,13 @@ func GetTaskRuleKeys() []string {
 	return keys
 }
 
+// Rule the rule define
 type Rule struct {
 	Head  func(ctx *Context) error
 	Nodes map[int]*Node
 }
 
+// Node the rule node of a task
 type Node struct {
 	OnRequest  func(ctx *Context, req *Request)
 	OnError    func(ctx *Context, res *Response, err error) error

@@ -5,7 +5,7 @@ import (
 	"github.com/nange/gospider/web/core"
 	"github.com/nange/gospider/web/model"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 )
 
 var mtsCh = make(chan common.MTS, 1)
@@ -15,14 +15,14 @@ func GetMTSChan() chan common.MTS {
 }
 
 func ManageTaskStatus() {
-	logrus.Infof("starting manage task status goroutine")
+	log.Infof("starting manage task status goroutine")
 	for {
 		select {
 		case mts := <-mtsCh:
 			task := &model.Task{}
-			err := model.NewTaskQuerySet(core.GetDB()).IDEq(mts.ID).One(task)
+			err := model.NewTaskQuerySet(core.GetGormDB()).IDEq(mts.ID).One(task)
 			if err != nil {
-				logrus.Errorf("query model task err: %+v", err)
+				log.Errorf("query model task err: %+v", err)
 				break
 			}
 
@@ -31,8 +31,8 @@ func ManageTaskStatus() {
 				task.Counts += 1
 			}
 
-			if err := task.Update(core.GetDB(), model.TaskDBSchema.Status, model.TaskDBSchema.Counts); err != nil {
-				logrus.Errorf("update task status err:%+v", errors.WithStack(err))
+			if err := task.Update(core.GetGormDB(), model.TaskDBSchema.Status, model.TaskDBSchema.Counts); err != nil {
+				log.Errorf("update task status err:%+v", errors.WithStack(err))
 				break
 			}
 

@@ -2,21 +2,23 @@ package spider
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/jinzhu/gorm"
-	"github.com/sirupsen/logrus"
 )
 
 // all code copied from gorm, just do some hack to support model defined by []string and map[string]constraints
 
+// OutputConstraint is the output constraint of db
 type OutputConstraint struct {
-	Sql         string
+	SQL         string
 	Index       string
 	UniqueIndex string
 }
 
-func NewSqlString(size int, defaultValue ...string) (sql string) {
+// NewSQLString is the convenience func to return varchar sql string
+func NewSQLString(size int, defaultValue ...string) (sql string) {
 	if len(defaultValue) == 0 {
 		sql = fmt.Sprintf("VARCHAR(%d) NOT NULL DEFAULT ''", size)
 	} else {
@@ -25,6 +27,7 @@ func NewSqlString(size int, defaultValue ...string) (sql string) {
 	return
 }
 
+// NewStringsConstraints is the convenience func to return varchar sql string of a batch columns
 func NewStringsConstraints(columns []string, size ...int) (constraints map[string]*OutputConstraint) {
 	s := make([]interface{}, len(size))
 	for i, v := range size {
@@ -33,50 +36,47 @@ func NewStringsConstraints(columns []string, size ...int) (constraints map[strin
 	return NewConstraints(columns, s...)
 }
 
-func NewConstraints(columns []string, sizeOrSqlConstraint ...interface{}) (constraints map[string]*OutputConstraint) {
+// NewConstraints is the convenience func to return the custom constraints
+func NewConstraints(columns []string, sizeOrSQLConstraint ...interface{}) (constraints map[string]*OutputConstraint) {
 	constraints = make(map[string]*OutputConstraint)
 
 	if len(columns) == 0 {
-		logrus.Error("columns should contain at least 1 element")
-		return
+		panic("columns should contain at least 1 element")
 	}
 
-	switch len(sizeOrSqlConstraint) {
+	switch len(sizeOrSQLConstraint) {
 	case 0:
-		logrus.Error("invalid parameter sizeOrSqlConstraint")
-		return
+		panic("invalid parameter sizeOrSqlConstraint")
 	case 1:
-		switch v := sizeOrSqlConstraint[0].(type) {
+		switch v := sizeOrSQLConstraint[0].(type) {
 		case int:
 			sql := fmt.Sprintf("VARCHAR(%d) NOT NULL DEFAULT ''", v)
 
 			for _, col := range columns {
-				constraints[col] = &OutputConstraint{Sql: sql}
+				constraints[col] = &OutputConstraint{SQL: sql}
 			}
 		case string:
 			if len(columns) > 1 {
-				logrus.Error("default sizeOrSqlConstraint for all columns should be integer")
+				panic("default sizeOrSqlConstraint for all columns should be integer")
 			} else {
-				constraints[columns[0]] = &OutputConstraint{Sql: v}
+				constraints[columns[0]] = &OutputConstraint{SQL: v}
 			}
 		default:
-			logrus.Error("invalid parameter type")
+			panic("invalid parameter type")
 		}
 	default:
-		if len(columns) != len(sizeOrSqlConstraint) {
-			logrus.Error("length of column and sizeOrSqlConstraint are not match")
-			return
+		if len(columns) != len(sizeOrSQLConstraint) {
+			panic("length of column and sizeOrSqlConstraint are not match")
 		}
 
 		for idx, col := range columns {
-			switch v := sizeOrSqlConstraint[idx].(type) {
+			switch v := sizeOrSQLConstraint[idx].(type) {
 			case int:
-				constraints[col] = &OutputConstraint{Sql: fmt.Sprintf("VARCHAR(%d) NOT NULL DEFAULT ''", v)}
+				constraints[col] = &OutputConstraint{SQL: fmt.Sprintf("VARCHAR(%d) NOT NULL DEFAULT ''", v)}
 			case string:
-				constraints[col] = &OutputConstraint{Sql: v}
+				constraints[col] = &OutputConstraint{SQL: v}
 			default:
-				logrus.Error(fmt.Sprintf("parameter form idx<%d>, column<%s> is invalid", idx, col))
-				return
+				panic(fmt.Sprintf("parameter form idx<%d>, column<%s> is invalid", idx, col))
 			}
 		}
 	}
@@ -84,6 +84,7 @@ func NewConstraints(columns []string, sizeOrSqlConstraint ...interface{}) (const
 	return
 }
 
+// AutoMigrateHack auto create table of the rule
 func AutoMigrateHack(s *gorm.DB, rule *TaskRule) *gorm.DB {
 	scope := s.NewScope(nil)
 	s = autoMigrate(scope, rule).DB()
@@ -92,8 +93,13 @@ func AutoMigrateHack(s *gorm.DB, rule *TaskRule) *gorm.DB {
 }
 
 func autoMigrate(scope *gorm.Scope, rule *TaskRule) (s *gorm.Scope) {
-	if rule.OutputToMultipleNamespaces {
-		for key := range rule.MultipleNamespacesConf {
+	if rule.OutputToMultipleNamespace {
+		keys := make([]string, 0, len(rule.MultipleNamespaceConf))
+		for key := range rule.MultipleNamespaceConf {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
 			s = autoMigrateSingle(scope, rule, key)
 		}
 	} else {
@@ -131,7 +137,7 @@ func createTable(scope *gorm.Scope, rule *TaskRule, table string) *gorm.Scope {
 	var tags []string
 	var primaryKeys []string
 
-	foundId := false
+	foundID := false
 	foundCreatedAt := false
 	columns, constraints, outputTableOpts := getOutputOpts(rule, table)
 
@@ -141,17 +147,17 @@ func createTable(scope *gorm.Scope, rule *TaskRule, table string) *gorm.Scope {
 		sqlTag := getColumnTag(field, constraints)
 
 		if lowerField == "id" {
-			foundId = true
+			foundID = true
 		}
 
 		if lowerField == "created_at" {
 			foundCreatedAt = true
 		}
 
-		lowerSqlTag := strings.ToLower(sqlTag)
-		if strings.Contains(lowerSqlTag, "primary key") {
+		lowerSQLTag := strings.ToLower(sqlTag)
+		if strings.Contains(lowerSQLTag, "primary key") {
 			isPrimaryKey = true
-			tags = append(tags, scope.Quote(field)+" "+strings.Replace(lowerSqlTag, "primary key", "", 1))
+			tags = append(tags, scope.Quote(field)+" "+strings.Replace(lowerSQLTag, "primary key", "", 1))
 		} else {
 			tags = append(tags, scope.Quote(field)+" "+sqlTag)
 		}
@@ -161,7 +167,7 @@ func createTable(scope *gorm.Scope, rule *TaskRule, table string) *gorm.Scope {
 		}
 	}
 
-	if !foundId {
+	if !foundID {
 		tags = append([]string{"`id` bigint(64) unsigned NOT NULL AUTO_INCREMENT"}, tags...)
 		primaryKeys = append(primaryKeys, `id`)
 	}
@@ -181,10 +187,10 @@ func createTable(scope *gorm.Scope, rule *TaskRule, table string) *gorm.Scope {
 }
 
 func getOutputOpts(rule *TaskRule, table string) (outputFields []string, outputConstraints map[string]*OutputConstraint, outputTableOpts string) {
-	if rule.OutputToMultipleNamespaces {
-		outputFields = rule.MultipleNamespacesConf[table].OutputFields
-		outputConstraints = rule.MultipleNamespacesConf[table].OutputConstraints
-		outputTableOpts = rule.MultipleNamespacesConf[table].OutputTableOpts
+	if rule.OutputToMultipleNamespace {
+		outputFields = rule.MultipleNamespaceConf[table].OutputFields
+		outputConstraints = rule.MultipleNamespaceConf[table].OutputConstraints
+		outputTableOpts = rule.MultipleNamespaceConf[table].OutputTableOpts
 	} else {
 		outputFields = rule.OutputFields
 		outputConstraints = rule.OutputConstraints
@@ -265,8 +271,8 @@ func getColumnTag(column string, constraints map[string]*OutputConstraint) (sqlT
 	}
 
 	if c, ok := constraints[column]; ok {
-		if c.Sql != "" {
-			sqlTag = c.Sql
+		if c.SQL != "" {
+			sqlTag = c.SQL
 		}
 	}
 

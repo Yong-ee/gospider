@@ -1,3 +1,5 @@
+// GoSpider is a simple go crawler framework.
+// User only need to care about the rules of page, provides web page to manage task. Base on colly.
 package gospider
 
 import (
@@ -6,22 +8,28 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/nange/gospider/web/core"
+
 	"github.com/nange/gospider/common"
 	"github.com/nange/gospider/web"
 	"github.com/pkg/errors"
 )
 
 const (
-	Name    = "gospider"
+	// Name is the name of gospider
+	Name = "gospider"
+	// Version is the version of gospider
 	Version = "1.0.0"
 )
 
+// GoSpider provides the spider instance for a scraping job
 type GoSpider struct {
 	backend string
 	mysql   common.MySQLConf
 	web     *web.Server
 }
 
+// New return a new instance of GoSpider
 func New(opts ...func(*GoSpider)) *GoSpider {
 	gs := &GoSpider{}
 	gs.init()
@@ -35,66 +43,75 @@ func New(opts ...func(*GoSpider)) *GoSpider {
 	return gs
 }
 
-// 启动gosipder
+// Run start GoSpider server
 func (gs *GoSpider) Run() error {
 	gs.print()
 	db, err := common.NewGormDB(gs.mysql)
 	if err != nil {
 		return errors.Wrap(err, "new gorm db failed")
 	}
-	gs.web.SetDB(db)
+	core.SetGormDB(db)
 
 	return errors.Wrap(gs.web.Run(), "web run failed")
 }
 
+// BackendMySQL sets the gospider backend with mysql
 func BackendMySQL() func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.backend = "mysql"
 	}
 }
 
+// BackendSQLite sets the gospider backend with sqllite
 func BackendSQLite() func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.backend = "sqlite"
 	}
 }
 
+// MySQLHost sets the mysql host
 func MySQLHost(host string) func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.mysql.Host = host
 	}
 }
 
+// MySQLPort sets the mysql port
 func MySQLPort(port int) func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.mysql.Port = port
 	}
 }
 
+// MySQLUser sets the mysql user
 func MySQLUser(user string) func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.mysql.User = user
 	}
 }
 
+// MySQLPassword sets the mysql password
 func MySQLPassword(password string) func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.mysql.Password = password
 	}
 }
 
+// MySQLDBName sets the mysql dbname
 func MySQLDBName(dbname string) func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.mysql.DBName = dbname
 	}
 }
 
+// WebIP sets the bind IP of gospider server
 func WebIP(ip string) func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.web.IP = ip
 	}
 }
 
+// WebPort sets the bind Port of gospider server
 func WebPort(port int) func(*GoSpider) {
 	return func(gs *GoSpider) {
 		gs.web.Port = port

@@ -10,7 +10,7 @@ import (
 	"github.com/nange/gospider/web/model"
 	"github.com/pkg/errors"
 	"github.com/robfig/cron"
-	"github.com/sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -43,23 +43,24 @@ func NewCronTask(taskID uint64, cronSpec string, retCh chan<- common.MTS) (*Cron
 
 func (ct *CronTask) Run() {
 	task := &model.Task{}
-	err := model.NewTaskQuerySet(core.GetDB()).IDEq(ct.taskID).One(task)
+	err := model.NewTaskQuerySet(core.GetGormDB()).IDEq(ct.taskID).One(task)
 	if err != nil {
-		logrus.Errorf("run cron task failed, query task err:%+v", errors.WithStack(err))
+		log.Errorf("run cron task failed, query task err:%+v", errors.WithStack(err))
 		return
 	}
 	if task.Status != common.TaskStatusCompleted && task.Status != common.TaskStatusUnexceptedExited {
-		logrus.Warnf("run cron task failed, status:%+v", errors.New(task.Status.String()))
+		log.Warnf("run cron task failed, status:%+v", errors.New(task.Status.String()))
 		return
 	}
 
 	spiderTask, err := GetSpiderTaskByModel(task)
 	if err != nil {
-		logrus.Errorf("run cron task failed, err:%+v", errors.WithStack(err))
+		log.Errorf("run cron task failed, err:%+v", errors.WithStack(err))
 		return
 	}
-	if err := spider.Run(spiderTask, ct.retCh); err != nil {
-		logrus.Errorf("run cron task failed, err:%+v", err)
+	s := spider.New(spiderTask, ct.retCh)
+	if err := s.Run(); err != nil {
+		log.Errorf("run cron task failed, err:%+v", err)
 		ct.retCh <- common.MTS{ID: task.ID, Status: common.TaskStatusUnexceptedExited}
 		return
 	}

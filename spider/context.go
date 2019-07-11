@@ -1,20 +1,28 @@
 package spider
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"os"
+	"path"
 	"strings"
 
-	qb "github.com/didi/gendry/builder"
 	"github.com/gocolly/colly"
 	"github.com/nange/gospider/common"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 )
 
+type key int
+
+const reqContexKey key = 0
+
+// Context gospider context of each callback
 type Context struct {
 	task  *Task
 	c     *colly.Collector
@@ -23,30 +31,66 @@ type Context struct {
 	ctlCtx    context.Context
 	ctlCancel context.CancelFunc
 
+	collyContext *colly.Context
 	// output
-	outputDB *sql.DB
+	outputDB       *sql.DB
+	outputCSVFiles map[string]io.WriteCloser
 }
 
-func newContext(ctx context.Context, cancel context.CancelFunc, task *Task, c *colly.Collector, nextC *colly.Collector) *Context {
-	return &Context{
+func newContext(ctx context.Context, cancel context.CancelFunc, task *Task, c *colly.Collector, nextC *colly.Collector) (*Context, error) {
+	gsCtx := &Context{
 		task:      task,
 		c:         c,
 		nextC:     nextC,
 		ctlCtx:    ctx,
 		ctlCancel: cancel,
 	}
+
+	if task.OutputConfig.Type == common.OutputTypeCSV {
+		gsCtx.outputCSVFiles = make(map[string]io.WriteCloser)
+		csvConf := task.OutputConfig.CSVConf
+		if task.OutputToMultipleNamespace {
+			for ns, conf := range task.MultipleNamespaceConf {
+				csvname := fmt.Sprintf("%s.csv", ns)
+				if err := createCSVFileIfNeeded(csvConf.CSVFilePath, csvname, conf.OutputFields); err != nil {
+					return nil, err
+				}
+				outputPath := path.Join(csvConf.CSVFilePath, csvname)
+				csvfile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, os.ModePerm)
+				if err != nil {
+					return nil, errors.Wrapf(err, "open csv file [%s] failed", csvname)
+				}
+				gsCtx.outputCSVFiles[ns] = csvfile
+			}
+		} else {
+			csvname := fmt.Sprintf("%s.csv", task.Namespace)
+			if err := createCSVFileIfNeeded(csvConf.CSVFilePath, csvname, task.OutputFields); err != nil {
+				return nil, err
+			}
+			outputPath := path.Join(csvConf.CSVFilePath, csvname)
+			csvfile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, os.ModePerm)
+			if err != nil {
+				return nil, errors.Wrapf(err, "open csv file [%s] failed", csvname)
+			}
+			gsCtx.outputCSVFiles[task.Namespace] = csvfile
+		}
+
+	}
+
+	return gsCtx, nil
 }
 
 func (ctx *Context) cloneWithReq(req *colly.Request) *Context {
-	newctx := context.WithValue(ctx.ctlCtx, "req", req)
+	newctx := context.WithValue(ctx.ctlCtx, reqContexKey, req)
 
 	return &Context{
-		task:      ctx.task,
-		c:         ctx.c,
-		nextC:     ctx.nextC,
-		ctlCtx:    newctx,
-		ctlCancel: ctx.ctlCancel,
-		outputDB:  ctx.outputDB,
+		task:           ctx.task,
+		c:              ctx.c,
+		nextC:          ctx.nextC,
+		ctlCtx:         newctx,
+		ctlCancel:      ctx.ctlCancel,
+		outputDB:       ctx.outputDB,
+		outputCSVFiles: ctx.outputCSVFiles,
 	}
 }
 
@@ -54,45 +98,91 @@ func (ctx *Context) setOutputDB(db *sql.DB) {
 	ctx.outputDB = db
 }
 
+func (ctx *Context) closeCSVFileIfNeeded() {
+	if len(ctx.outputCSVFiles) == 0 {
+		return
+	}
+	for ns, closer := range ctx.outputCSVFiles {
+		log.Debugf("closing csv file [%s]", ns+".csv")
+		closer.Close()
+	}
+}
+
+// GetRequest return the request on this context
 func (ctx *Context) GetRequest() *Request {
-	collyReq := ctx.ctlCtx.Value("req").(*colly.Request)
-	return newRequest(collyReq, ctx)
+	if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+		return newRequest(req, ctx)
+	}
+	return nil
 }
 
+// Retry retry current request again
 func (ctx *Context) Retry() error {
-	return ctx.ctlCtx.Value("req").(*colly.Request).Retry()
+	if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+		return req.Retry()
+	}
+
+	return nil
 }
 
+// PutReqContextValue sets the value for a key
 func (ctx *Context) PutReqContextValue(key string, value interface{}) {
-	ctx.ctlCtx.Value("req").(*colly.Request).Ctx.Put(key, value)
+	if ctx.collyContext == nil {
+		if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+			ctx.collyContext = req.Ctx
+		} else {
+			ctx.collyContext = colly.NewContext()
+		}
+	}
+	ctx.collyContext.Put(key, value)
 }
 
+// GetReqContextValue return the string value for a key on ctx
 func (ctx *Context) GetReqContextValue(key string) string {
-	return ctx.ctlCtx.Value("req").(*colly.Request).Ctx.Get(key)
+	if ctx.collyContext == nil {
+		if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+			ctx.collyContext = req.Ctx
+		} else {
+			return ""
+		}
+	}
+	return ctx.collyContext.Get(key)
 }
 
+// GetAnyReqContextValue return the interface value for a key on ctx
 func (ctx *Context) GetAnyReqContextValue(key string) interface{} {
-	return ctx.ctlCtx.Value("req").(*colly.Request).Ctx.GetAny(key)
+	if ctx.collyContext == nil {
+		if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+			ctx.collyContext = req.Ctx
+		} else {
+			return nil
+		}
+	}
+	return ctx.collyContext.GetAny(key)
 }
 
+// Visit issues a GET to the specified URL
 func (ctx *Context) Visit(URL string) error {
-	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
-		return ctx.c.Visit(req.AbsoluteURL(URL))
-	}
-	return ctx.c.Visit(URL)
+	return ctx.c.Visit(ctx.AbsoluteURL(URL))
 }
 
+// VisitWithContext issues a GET to the specified URL with current context
+func (ctx *Context) VisitWithContext(URL string) error {
+	return ctx.RequestWithContext("GET", ctx.AbsoluteURL(URL), nil, nil)
+}
+
+// VisitForNext issues a GET to the specified URL for next step
 func (ctx *Context) VisitForNext(URL string) error {
-	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
-		return ctx.nextC.Visit(req.AbsoluteURL(URL))
-	}
-	return ctx.nextC.Visit(URL)
+	return ctx.nextC.Visit(ctx.AbsoluteURL(URL))
 }
 
 func (ctx *Context) reqContextClone() *colly.Context {
 	newCtx := colly.NewContext()
-	req := ctx.ctlCtx.Value("req").(*colly.Request)
-	req.Ctx.ForEach(func(k string, v interface{}) interface{} {
+	if ctx.collyContext == nil {
+		return newCtx
+	}
+
+	ctx.collyContext.ForEach(func(k string, v interface{}) interface{} {
 		newCtx.Put(k, v)
 		return nil
 	})
@@ -100,132 +190,92 @@ func (ctx *Context) reqContextClone() *colly.Context {
 	return newCtx
 }
 
+// VisitForNextWithContext issues a GET to the specified URL for next step with previous context
 func (ctx *Context) VisitForNextWithContext(URL string) error {
-	req := ctx.ctlCtx.Value("req").(*colly.Request)
-	return ctx.nextC.Request("GET", req.AbsoluteURL(URL), nil, ctx.reqContextClone(), nil)
+	return ctx.RequestForNextWithContext("GET", ctx.AbsoluteURL(URL), nil, nil)
 }
 
+// Post issues a POST to the specified URL
 func (ctx *Context) Post(URL string, requestData map[string]string) error {
-	return ctx.c.Post(URL, requestData)
+	return ctx.c.Post(ctx.AbsoluteURL(URL), requestData)
 }
 
+// PostWithContext issues a POST to the specified URL with current context
+func (ctx *Context) PostWithContext(URL string, requestData map[string]string) error {
+	return ctx.RequestWithContext("POST", ctx.AbsoluteURL(URL), createFormReader(requestData), nil)
+}
+
+// PostForNext issues a POST to the specified URL for next step
 func (ctx *Context) PostForNext(URL string, requestData map[string]string) error {
-	return ctx.nextC.Post(URL, requestData)
+	return ctx.nextC.Post(ctx.AbsoluteURL(URL), requestData)
 }
 
+// PostForNextWithContext issues a POST to the specified URL for next step with previous context
+func (ctx *Context) PostForNextWithContext(URL string, requestData map[string]string) error {
+	return ctx.RequestForNextWithContext("POST", ctx.AbsoluteURL(URL), createFormReader(requestData), nil)
+}
+
+// PostRawForNext issues a rawData POST to the specified URL
 func (ctx *Context) PostRawForNext(URL string, requestData []byte) error {
-	return ctx.nextC.PostRaw(URL, requestData)
+	return ctx.nextC.PostRaw(ctx.AbsoluteURL(URL), requestData)
 }
 
+// PostRawForNextWithContext issues a rawData POST to the specified URL for next step with previous context
+func (ctx *Context) PostRawForNextWithContext(URL string, requestData []byte) error {
+	return ctx.nextC.Request("POST", ctx.AbsoluteURL(URL), bytes.NewReader(requestData), ctx.reqContextClone(), nil)
+}
+
+// Request low level method to send HTTP request
+func (ctx *Context) Request(method, URL string, requestData io.Reader, hdr http.Header) error {
+	return ctx.c.Request(method, URL, requestData, nil, hdr)
+}
+
+// RequestWithContext low level method to send HTTP request with context
+func (ctx *Context) RequestWithContext(method, URL string, requestData io.Reader, hdr http.Header) error {
+	return ctx.c.Request(method, URL, requestData, ctx.reqContextClone(), hdr)
+}
+
+// RequestForNext low level method to send HTTP request for next step
 func (ctx *Context) RequestForNext(method, URL string, requestData io.Reader, hdr http.Header) error {
 	return ctx.nextC.Request(method, URL, requestData, nil, hdr)
 }
 
+// RequestForNextWithContext low level method to send HTTP request for next step with previous context
 func (ctx *Context) RequestForNextWithContext(method, URL string, requestData io.Reader, hdr http.Header) error {
 	return ctx.nextC.Request(method, URL, requestData, ctx.reqContextClone(), hdr)
 }
 
+// PostMultipartForNext issues a multipart POST to the specified URL for next step
 func (ctx *Context) PostMultipartForNext(URL string, requestData map[string][]byte) error {
 	return ctx.nextC.PostMultipart(URL, requestData)
 }
 
+// SetResponseCharacterEncoding set the response charscter encoding on the request
 func (ctx *Context) SetResponseCharacterEncoding(encoding string) {
-	ctx.ctlCtx.Value("req").(*colly.Request).ResponseCharacterEncoding = encoding
+	if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+		req.ResponseCharacterEncoding = encoding
+	}
 }
 
+// AbsoluteURL return the absolute URL of u
 func (ctx *Context) AbsoluteURL(u string) string {
-	return ctx.ctlCtx.Value("req").(*colly.Request).AbsoluteURL(u)
+	if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+		return req.AbsoluteURL(u)
+	}
+	return u
 }
 
+// Abort abort the current request
 func (ctx *Context) Abort() {
-	ctx.ctlCtx.Value("req").(*colly.Request).Abort()
+	if req, ok := ctx.ctlCtx.Value(reqContexKey).(*colly.Request); ok {
+		req.Abort()
+	}
 }
 
-func (ctx *Context) Output(row map[int]interface{}, namespace ...string) error {
-	var outputFields []string
-	var ns string
-
-	switch len(namespace) {
-	case 0:
-		outputFields = ctx.task.OutputFields
-		ns = ctx.task.Namespace
-	case 1:
-		if !ctx.task.OutputToMultipleNamespaces {
-			return ErrOutputToMultipleTableDisabled
-		}
-		outputFields = ctx.task.MultipleNamespacesConf[namespace[0]].OutputFields
-		ns = namespace[0]
-	default:
-		return ErrTooManyOutputTables
+func createFormReader(data map[string]string) io.Reader {
+	form := url.Values{}
+	for k, v := range data {
+		form.Add(k, v)
 	}
-
-	if err := ctx.checkOutput(row, outputFields); err != nil {
-		logrus.Errorf("checkOutput failed! err:%+v, fields:%#v, row:%+v", err, outputFields, row)
-		return err
-	}
-	logrus.Infof("output row:%+v", row)
-
-	if ctx.task.OutputConfig.Type == common.OutputTypeMySQL {
-		if err := ctx.outputToDB(row, outputFields, ns); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (ctx *Context) checkOutput(row map[int]interface{}, outputFields []string) error {
-	if len(outputFields) != len(row) {
-		return ErrOutputFieldsNotMatchOutputRow
-	}
-
-	for i := 0; i < len(outputFields); i++ {
-		if _, ok := row[i]; !ok {
-			return ErrOutputFieldsNotMatchOutputRow
-		}
-	}
-
-	return nil
-}
-
-func (ctx *Context) outputToDB(row map[int]interface{}, outputFields []string, table string) error {
-	data := make(map[string]interface{})
-	for i, field := range outputFields {
-		data[field] = row[i]
-	}
-
-	cond, vals, err := qb.BuildInsert(table, []map[string]interface{}{data})
-	if err != nil {
-		logrus.Errorf("build insert sql failed! err:%s, namespace:%s, row:%+v", err.Error(), table, row)
-		return errors.WithStack(err)
-	}
-
-	quotedCond, err := quoteQuery(cond)
-	if err != nil {
-		logrus.Error(err)
-		return errors.WithStack(err)
-	}
-
-	if _, err := ctx.outputDB.Exec(quotedCond, vals...); err != nil {
-		logrus.Errorf("exec insert sql failed! err:%s, cond:%s, vals:%+v", err.Error(), quotedCond, vals)
-		return errors.WithStack(err)
-	}
-
-	return nil
-}
-
-func (ctx *Context) outputToCVS(row map[int]interface{}) error {
-	return nil
-}
-
-func quoteQuery(sql string) (s string, err error) {
-	reg := regexp.MustCompile(`(?sU)(INSERT INTO .+ \(\s*)(.+)(\s*\) VALUES.+\))`)
-	matches := reg.FindStringSubmatch(sql)
-	if len(matches) != 4 {
-		err = errors.New("quote sql regexp not match")
-		return
-	}
-	fields := strings.Replace(matches[2], ",", "`,`", -1)
-	s = matches[1] + "`" + fields + "`" + matches[3]
-	return
+	return strings.NewReader(form.Encode())
 }

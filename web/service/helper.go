@@ -5,12 +5,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nange/gospider/web/core"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/nange/gospider/common"
 	"github.com/nange/gospider/spider"
-	"github.com/nange/gospider/web/core"
 	"github.com/nange/gospider/web/model"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 func GetSpiderTaskByModel(task *model.Task) (*spider.Task, error) {
@@ -35,16 +36,17 @@ func GetSpiderTaskByModel(task *model.Task) (*spider.Task, error) {
 		}
 	}
 
-	sdb := model.SysDB{}
-	query := model.NewSysDBQuerySet(core.GetDB())
-	if err := query.IDEq(task.OutputSysDBID).One(&sdb); err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	if hasOutputConstraints(rule) && task.OutputType == common.OutputTypeMySQL && task.AutoMigrate {
-		err = autoMigrate(task, &sdb, rule)
-		if err != nil {
-			logrus.Error(err)
+	edb := model.ExportDB{}
+	if task.OutputType == common.OutputTypeMySQL {
+		query := model.NewExportDBQuerySet(core.GetGormDB())
+		if err := query.IDEq(task.OutputExportDBID).One(&edb); err != nil {
+			return nil, errors.Wrapf(err, "task.OutputExportDBID [%v]", task.OutputExportDBID)
+		}
+		if hasOutputConstraints(rule) && task.AutoMigrate {
+			err = autoMigrate(&edb, rule)
+			if err != nil {
+				log.Errorf("autoMigrate err [%+v]", errors.WithStack(err))
+			}
 		}
 	}
 
@@ -58,6 +60,7 @@ func GetSpiderTaskByModel(task *model.Task) (*spider.Task, error) {
 			AllowURLRevisit:        rule.AllowURLRevisit,
 			MaxBodySize:            task.OptMaxBodySize,
 			IgnoreRobotsTxt:        rule.IgnoreRobotsTxt,
+			InsecureSkipVerify:     rule.InsecureSkipVerify,
 			ParseHTTPErrorResponse: rule.ParseHTTPErrorResponse,
 			DisableCookies:         rule.DisableCookies,
 		},
@@ -70,14 +73,24 @@ func GetSpiderTaskByModel(task *model.Task) (*spider.Task, error) {
 		},
 		OutputConfig: spider.OutputConfig{
 			Type: task.OutputType,
-			MySQLConf: spider.MySQLConf{
-				Host:     sdb.Host,
-				Port:     sdb.Port,
-				User:     sdb.User,
-				Password: sdb.Password,
-				DBName:   sdb.DBName,
-			},
 		},
+	}
+	if task.OutputType == common.OutputTypeMySQL {
+		config.OutputConfig.MySQLConf = common.MySQLConf{
+			Host:     edb.Host,
+			Port:     edb.Port,
+			User:     edb.User,
+			Password: edb.Password,
+			DBName:   edb.DBName,
+		}
+	} else if task.OutputType == common.OutputTypeCSV {
+		config.OutputConfig.CSVConf = spider.CSVConf{
+			CSVFilePath: "./csv_output",
+		}
+	}
+
+	if task.OptRequestTimeout > 0 {
+		config.Option.RequestTimeout = time.Duration(task.OptRequestTimeout) * time.Second
 	}
 	if urls := strings.TrimSpace(task.ProxyURLs); len(urls) > 0 {
 		config.ProxyURLs = strings.Split(urls, ",")
@@ -87,9 +100,9 @@ func GetSpiderTaskByModel(task *model.Task) (*spider.Task, error) {
 }
 
 func hasOutputConstraints(rule *spider.TaskRule) (b bool) {
-	if rule.OutputToMultipleNamespaces {
-		for k := range rule.MultipleNamespacesConf {
-			if len(rule.MultipleNamespacesConf[k].OutputConstraints) > 0 {
+	if rule.OutputToMultipleNamespace {
+		for k := range rule.MultipleNamespaceConf {
+			if len(rule.MultipleNamespaceConf[k].OutputConstraints) > 0 {
 				b = true
 				return
 			}
@@ -101,7 +114,7 @@ func hasOutputConstraints(rule *spider.TaskRule) (b bool) {
 	return
 }
 
-func autoMigrate(task *model.Task, sdb *model.SysDB, rule *spider.TaskRule) (err error) {
+func autoMigrate(sdb *model.ExportDB, rule *spider.TaskRule) (err error) {
 	db, err := common.NewGormDB(common.MySQLConf{
 		Host:     sdb.Host,
 		Port:     sdb.Port,

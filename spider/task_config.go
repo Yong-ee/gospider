@@ -1,17 +1,21 @@
 package spider
 
 import (
-	"database/sql"
+	"crypto/tls"
+	"net/http"
 	"regexp"
 	"time"
 
-	"github.com/didi/gendry/manager"
+	// import the mysql driver
 	_ "github.com/go-sql-driver/mysql"
+
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/proxy"
+	"github.com/nange/gospider/common"
 	"github.com/pkg/errors"
 )
 
+// TaskConfig is the config of a task
 type TaskConfig struct {
 	CronSpec     string
 	Option       Option
@@ -20,6 +24,7 @@ type TaskConfig struct {
 	OutputConfig OutputConfig
 }
 
+// Option is the config option of a task
 type Option struct {
 	UserAgent              string
 	MaxDepth               int
@@ -28,10 +33,13 @@ type Option struct {
 	AllowURLRevisit        bool
 	MaxBodySize            int
 	IgnoreRobotsTxt        bool
+	InsecureSkipVerify     bool
 	ParseHTTPErrorResponse bool
 	DisableCookies         bool
+	RequestTimeout         time.Duration
 }
 
+// Limit is the limit of a task
 type Limit struct {
 	Enable bool
 	// DomainRegexp is a regular expression to match against domains
@@ -46,23 +54,16 @@ type Limit struct {
 	Parallelism int
 }
 
+// OutputConfig is the output config of a task
 type OutputConfig struct {
 	Type      string
 	CSVConf   CSVConf
-	MySQLConf MySQLConf
+	MySQLConf common.MySQLConf
 }
 
+// CSVConf is the csv conf of a task
 type CSVConf struct {
 	CSVFilePath string
-	CSVFileName string
-}
-
-type MySQLConf struct {
-	Host     string
-	Port     int
-	User     string
-	Password string
-	DBName   string
 }
 
 func newCollector(config TaskConfig) (*colly.Collector, error) {
@@ -130,21 +131,16 @@ func newCollector(config TaskConfig) (*colly.Collector, error) {
 		c.Limit(&limit)
 	}
 
-	return c, nil
-}
-
-func newDB(conf MySQLConf) (*sql.DB, error) {
-	db, err := manager.New(conf.DBName, conf.User, conf.Password, conf.Host).
-		Port(conf.Port).
-		Set(
-			manager.SetCharset("utf8"),
-			manager.SetParseTime(true),
-			manager.SetLoc("Local"),
-		).Open(true)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	if config.Option.RequestTimeout > 0 {
+		c.SetRequestTimeout(config.Option.RequestTimeout)
 	}
-	db.SetMaxIdleConns(5)
-	db.SetMaxOpenConns(10)
-	return db, nil
+
+	if config.Option.InsecureSkipVerify {
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		c.WithTransport(tr)
+	}
+
+	return c, nil
 }
